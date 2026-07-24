@@ -176,6 +176,7 @@ def train_client(
     lambda_proto: float = 1.0,
     prototype_state: torch.Tensor | None = None,
     prototype_temperature: float = 0.1,
+    aggregate_style_params: bool = False,
     log_fn: Callable[[str], None] | None = None,
 ) -> Tuple[
     Dict[str, torch.Tensor],
@@ -203,7 +204,8 @@ def train_client(
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     adapter_mode = _infer_adapter_mode(featurizer)
-    group_adapter_names = get_style_group_adapter_names(featurizer) if adapter_mode else {}
+    collect_private_style_stats = adapter_mode and not aggregate_style_params
+    group_adapter_names = get_style_group_adapter_names(featurizer) if collect_private_style_stats else {}
     setup_trainable_params(model, adapter_mode)
 
     trainable_named_params = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
@@ -232,13 +234,17 @@ def train_client(
                 f"prototype_state shape mismatch, expected {(num_classes, feature_dim)} got {tuple(prototype_state.shape)}"
             )
         frozen_protos = prototype_state.to(device=device, dtype=torch.float32).clone()
-    valid_proto_mask = frozen_protos.norm(dim=-1) > 1e-6
-    has_valid_prototypes = bool(valid_proto_mask.any().item())
+    # lambda_proto=0 removes the complete training-time prototype-loss path.
+    valid_proto_mask: torch.Tensor | None = None
+    has_valid_prototypes = False
     proto_bank: torch.Tensor | None = None
     invalid_proto_mask: torch.Tensor | None = None
-    if has_valid_prototypes:
-        proto_bank = F.normalize(frozen_protos, p=2, dim=-1, eps=1e-6)
-        invalid_proto_mask = ~valid_proto_mask.unsqueeze(0)
+    if lambda_proto > 0.0:
+        valid_proto_mask = frozen_protos.norm(dim=-1) > 1e-6
+        has_valid_prototypes = bool(valid_proto_mask.any().item())
+        if has_valid_prototypes:
+            proto_bank = F.normalize(frozen_protos, p=2, dim=-1, eps=1e-6)
+            invalid_proto_mask = ~valid_proto_mask.unsqueeze(0)
 
     model.train()
     loss_sum = torch.zeros((), device=device, dtype=torch.float64)
@@ -249,7 +255,6 @@ def train_client(
     group_raw_style_sum: dict[str, torch.Tensor | None] = {group_name: None for group_name in STYLE_GROUP_NAMES}
     group_raw_style_sq_sum: dict[str, torch.Tensor | None] = {group_name: None for group_name in STYLE_GROUP_NAMES}
     group_raw_style_count: dict[str, int] = {group_name: 0 for group_name in STYLE_GROUP_NAMES}
-
     for epoch in range(epochs):
         epoch_start = time.perf_counter()
         epoch_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
@@ -268,7 +273,11 @@ def train_client(
                     set_adapter_mode(model, "full")
                     features_full = featurizer(images)
                     logits_full = classifier(features_full)
-                    style_feature_groups = collect_style_anchor_feature_groups(featurizer) if adapter_mode else None
+                    style_feature_groups = (
+                        collect_style_anchor_feature_groups(featurizer)
+                        if collect_private_style_stats
+                        else None
+                    )
                     with torch.no_grad():
                         if style_feature_groups is not None:
                             for group_name in STYLE_GROUP_NAMES:
@@ -287,6 +296,7 @@ def train_client(
                     if lambda_proto > 0.0 and has_valid_prototypes:
                         assert proto_bank is not None
                         assert invalid_proto_mask is not None
+                        assert valid_proto_mask is not None
                         proto_feat = F.normalize(features_full.to(torch.float32), p=2, dim=-1, eps=1e-6)
                         proto_logits = torch.matmul(proto_feat, proto_bank.t()) / prototype_temperature
                         proto_logits = proto_logits.masked_fill(invalid_proto_mask, -1e4)
@@ -388,7 +398,7 @@ def train_client(
         for name, tensor in featurizer.state_dict().items():
             if not _is_adapter_param_name(name):
                 continue
-            if ("style_down" in name) or ("style_up" in name):
+            if not aggregate_style_params and (("style_down" in name) or ("style_up" in name)):
                 style_state[name] = tensor.detach().cpu().to(torch.float32)
             else:
                 adapter_state[name] = tensor.detach().cpu().to(torch.float32)
@@ -405,7 +415,7 @@ def train_client(
 
     style_stats: Dict[str, Any] = {}
     group_stats: Dict[str, Dict[str, Any]] = {}
-    if adapter_mode:
+    if collect_private_style_stats:
         expected_group_count: int | None = None
         for group_name in STYLE_GROUP_NAMES:
             group_count = int(group_raw_style_count[group_name])

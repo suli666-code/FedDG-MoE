@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import math
 import os
 import time
 from datetime import datetime
@@ -38,6 +39,11 @@ from feddg_utils import (
 from network.get_network import GetNetwork, set_adapter_mode, set_router_progress
 
 
+def _ensemble_weight_tag(cls_weight: float, proto_weight: float) -> str:
+    """Return a filesystem-safe identifier for one dual-head fusion setting."""
+    return f"cls{cls_weight:.2f}_proto{proto_weight:.2f}".replace(".", "p")
+
+
 def run_federated_task(
     *,
     args: argparse.Namespace,
@@ -47,12 +53,14 @@ def run_federated_task(
     resolved_num_workers: int,
 ) -> Dict[str, Any]:
     _seed_everything(args.seed)
+    aggregate_style_params = args.style_param_mode == "aggregate"
 
     domain_to_code = full_domain_to_code if args.dataset == "pacs" else (lambda d: d)
     source_domains_full = [d for d in expert_order_full if d != target_domain_full]
     source_domains_code = [domain_to_code(d) for d in source_domains_full]
 
-    run_name = f"{args.dataset}_{target_domain_full}_{run_stamp}"
+    ensemble_weight_tag = _ensemble_weight_tag(args.cls_ensemble_weight, args.proto_ensemble_weight)
+    run_name = f"{args.dataset}_{target_domain_full}_{ensemble_weight_tag}_{run_stamp}"
     log_path = os.path.join(args.log_dir, f"train_{run_name}.log")
     tb_run_dir = os.path.join(args.tb_log_dir, run_name)
     logger = _setup_run_logger(
@@ -71,7 +79,10 @@ def run_federated_task(
     current_round_idx: int | None = None
     best_val_acc = float("-inf")
     best_round = -1
-    best_val_acc_criterion = "source_val_ensemble_acc_avg"
+    best_val_acc_criterion = (
+        "source_val_ensemble_acc_avg"
+        f"[cls={args.cls_ensemble_weight:.2f},proto={args.proto_ensemble_weight:.2f}]"
+    )
 
     try:
         logger.info(
@@ -83,7 +94,18 @@ def run_federated_task(
         )
         logger.info("Task seed reset: seed=%d target=%s", int(args.seed), target_domain_full)
         logger.info("Using device=%s num_workers=%d", args.device, resolved_num_workers)
+        logger.info(
+            "Dual-head ensemble weights: cls=%.2f proto=%.2f; checkpoint selection uses this source-validation ensemble.",
+            args.cls_ensemble_weight,
+            args.proto_ensemble_weight,
+        )
         logger.info("Args snapshot: %s", json.dumps(vars(args), ensure_ascii=False))
+        if aggregate_style_params:
+            logger.info(
+                "Style parameter mode=aggregate: style_down/style_up join FedAvg; "
+                "test-time TTA fusion (%s) is disabled.",
+                args.tta_fusion,
+            )
 
         dataloader_dict, _, _, target_domain_code = build_feddg_dataloaders(
             dataset_name=args.dataset,
@@ -109,7 +131,10 @@ def run_federated_task(
         global_model.to(args.device)
         _log_model_param_stats(global_model, logger)
 
-        main_expert_state = _extract_adapter_state_from_model(global_model)
+        main_expert_state = _extract_adapter_state_from_model(
+            global_model,
+            include_style_params=aggregate_style_params,
+        )
         main_classifier_state = _extract_classifier_state_from_model(global_model)
         classifier_head = global_model[1]
         if not hasattr(classifier_head, "out_features") or not hasattr(classifier_head, "in_features"):
@@ -156,7 +181,11 @@ def run_federated_task(
                 set_router_progress(client_model, router_progress)
                 set_adapter_mode(client_model, "full")
 
-                if src_code in client_style_states and len(client_style_states[src_code]) > 0:
+                if (
+                    not aggregate_style_params
+                    and src_code in client_style_states
+                    and len(client_style_states[src_code]) > 0
+                ):
                     _load_adapter_state_to_model(client_model, client_style_states[src_code])
 
                 (
@@ -179,10 +208,12 @@ def run_federated_task(
                     lambda_proto=round_lambda_proto,
                     prototype_state=global_prototype_state,
                     prototype_temperature=args.prototype_temperature,
+                    aggregate_style_params=aggregate_style_params,
                     log_fn=logger.info,
                 )
-                client_style_states[src_code] = style_state
-                client_style_stats[src_code] = style_stats
+                if not aggregate_style_params:
+                    client_style_states[src_code] = style_state
+                    client_style_stats[src_code] = style_stats
                 client_adapter_states.append(adapter_state)
                 client_classifier_states.append(classifier_state)
                 client_prototype_states.append(prototype_state)
@@ -224,7 +255,11 @@ def run_federated_task(
             set_router_progress(global_model, router_progress)
             set_adapter_mode(global_model, "full")
             for src_code in source_domains_code:
-                if src_code in client_style_states and len(client_style_states[src_code]) > 0:
+                if (
+                    not aggregate_style_params
+                    and src_code in client_style_states
+                    and len(client_style_states[src_code]) > 0
+                ):
                     _load_adapter_state_to_model(global_model, client_style_states[src_code])
                 src_val_ensemble_acc, src_val_cls_acc, src_val_proto_acc = evaluate_target(
                     global_model,
@@ -232,6 +267,8 @@ def run_federated_task(
                     args.device,
                     global_prototypes=global_prototype_state,
                     prototype_temperature=args.prototype_temperature,
+                    cls_ensemble_weight=args.cls_ensemble_weight,
+                    proto_ensemble_weight=args.proto_ensemble_weight,
                 )
                 source_val_ensemble_acc_list.append(float(src_val_ensemble_acc))
                 source_val_cls_acc_list.append(float(src_val_cls_acc))
@@ -244,17 +281,32 @@ def run_federated_task(
             source_val_proto_acc_avg = float(sum(source_val_proto_acc_list) / max(1, len(source_val_proto_acc_list)))
 
             set_adapter_mode(global_model, "full")
-            tgt_test_ensemble_acc, tgt_test_cls_acc, tgt_test_proto_acc, tta_report = evaluate_target_with_style_mode(
-                global_model,
-                target_test_loader,
-                args.device,
-                client_style_states=client_style_states,
-                client_style_stats=client_style_stats,
-                source_domains=source_domains_code,
-                global_prototypes=global_prototype_state,
-                args=args,
-                logger=logger,
-            )
+            if aggregate_style_params:
+                tgt_test_ensemble_acc, tgt_test_cls_acc, tgt_test_proto_acc = evaluate_target(
+                    global_model,
+                    target_test_loader,
+                    args.device,
+                    global_prototypes=global_prototype_state,
+                    prototype_temperature=args.prototype_temperature,
+                    cls_ensemble_weight=args.cls_ensemble_weight,
+                    proto_ensemble_weight=args.proto_ensemble_weight,
+                )
+                tta_report = {
+                    "mode": "disabled_global_style_aggregation",
+                    "reason": "style_param_mode=aggregate",
+                }
+            else:
+                tgt_test_ensemble_acc, tgt_test_cls_acc, tgt_test_proto_acc, tta_report = evaluate_target_with_style_mode(
+                    global_model,
+                    target_test_loader,
+                    args.device,
+                    client_style_states=client_style_states,
+                    client_style_stats=client_style_stats,
+                    source_domains=source_domains_code,
+                    global_prototypes=global_prototype_state,
+                    args=args,
+                    logger=logger,
+                )
             set_adapter_mode(global_model, "full")
             round_train_loss = sum(client_losses) / max(1, len(client_losses))
             round_elapsed = time.perf_counter() - round_start
@@ -288,6 +340,10 @@ def run_federated_task(
             last_round_payload = {
                 "round": round_idx + 1,
                 "target_domain": target_domain_full,
+                "ensemble_weights": {
+                    "classifier": float(args.cls_ensemble_weight),
+                    "prototype": float(args.proto_ensemble_weight),
+                },
                 "source_val_ensemble_acc_avg": float(source_val_ensemble_acc_avg),
                 "source_val_cls_acc_avg": float(source_val_cls_acc_avg),
                 "source_val_proto_acc_avg": float(source_val_proto_acc_avg),
@@ -334,17 +390,32 @@ def run_federated_task(
             )
             set_router_progress(global_model, best_router_progress)
             set_adapter_mode(global_model, "full")
-            test_ensemble_acc, test_cls_acc, test_proto_acc, final_tta_report = evaluate_target_with_style_mode(
-                global_model,
-                target_test_loader,
-                args.device,
-                client_style_states=best_style_states,
-                client_style_stats=best_style_stats,
-                source_domains=source_domains_code,
-                global_prototypes=global_prototype_state,
-                args=args,
-                logger=logger,
-            )
+            if aggregate_style_params:
+                test_ensemble_acc, test_cls_acc, test_proto_acc = evaluate_target(
+                    global_model,
+                    target_test_loader,
+                    args.device,
+                    global_prototypes=global_prototype_state,
+                    prototype_temperature=args.prototype_temperature,
+                    cls_ensemble_weight=args.cls_ensemble_weight,
+                    proto_ensemble_weight=args.proto_ensemble_weight,
+                )
+                final_tta_report = {
+                    "mode": "disabled_global_style_aggregation",
+                    "reason": "style_param_mode=aggregate",
+                }
+            else:
+                test_ensemble_acc, test_cls_acc, test_proto_acc, final_tta_report = evaluate_target_with_style_mode(
+                    global_model,
+                    target_test_loader,
+                    args.device,
+                    client_style_states=best_style_states,
+                    client_style_stats=best_style_stats,
+                    source_domains=source_domains_code,
+                    global_prototypes=global_prototype_state,
+                    args=args,
+                    logger=logger,
+                )
             set_adapter_mode(global_model, "full")
             best_payload["target_test_ensemble_acc"] = float(test_ensemble_acc)
             best_payload["target_test_cls_acc"] = float(test_cls_acc)
@@ -448,6 +519,34 @@ def main():
     optim_group.add_argument("--content_rank", type=int, default=32, help="Content adapter bottleneck rank.")
     optim_group.add_argument("--style_rank", type=int, default=4, help="Style adapter bottleneck rank.")
 
+    ensemble_group = parser.add_argument_group("Dual-head ensemble")
+    ensemble_group.add_argument(
+        "--cls_ensemble_weight",
+        type=float,
+        default=0.5,
+        help="Classifier-head probability weight; it must be non-negative and sum to 1 with --proto_ensemble_weight.",
+    )
+    ensemble_group.add_argument(
+        "--proto_ensemble_weight",
+        type=float,
+        default=0.5,
+        help="Prototype-head probability weight; it must be non-negative and sum to 1 with --cls_ensemble_weight.",
+    )
+
+    ablation_group = parser.add_argument_group("Ablations")
+    ablation_group.add_argument(
+        "--tta_fusion",
+        choices=["grouped", "global"],
+        default="global",
+        help="Source-private style TTA fusion: one global W2 weight (default) or per-group W2.",
+    )
+    ablation_group.add_argument(
+        "--style_param_mode",
+        choices=["private", "aggregate"],
+        default="private",
+        help="Keep style parameters source-private (default) or include them in FedAvg and disable TTA.",
+    )
+
     runtime_group = parser.add_argument_group("Runtime")
     runtime_group.add_argument("--seed", type=int, default=0)
     runtime_group.add_argument(
@@ -466,6 +565,16 @@ def main():
     args.optimizer = "sgd"
     if args.prototype_temperature <= 0.0:
         raise ValueError(f"--proto_tau must be > 0, got {args.prototype_temperature}")
+    if not math.isfinite(args.cls_ensemble_weight) or not math.isfinite(args.proto_ensemble_weight):
+        raise ValueError("--cls_ensemble_weight and --proto_ensemble_weight must be finite.")
+    if args.cls_ensemble_weight < 0.0 or args.proto_ensemble_weight < 0.0:
+        raise ValueError("--cls_ensemble_weight and --proto_ensemble_weight must be non-negative.")
+    ensemble_weight_sum = args.cls_ensemble_weight + args.proto_ensemble_weight
+    if abs(ensemble_weight_sum - 1.0) > 1e-6:
+        raise ValueError(
+            "--cls_ensemble_weight and --proto_ensemble_weight must sum to 1, got "
+            f"{ensemble_weight_sum}."
+        )
     if args.proto_warmup_rounds < 0:
         raise ValueError(f"--proto_warmup_rounds must be >= 0, got {args.proto_warmup_rounds}")
     if args.router_anneal_rounds is None:
