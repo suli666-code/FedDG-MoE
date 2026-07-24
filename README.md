@@ -9,7 +9,7 @@ grouped early/middle/late raw-batch source-whitened diagonal W2
 early/middle/late 三组全部参与 source-private style_down/style_up fusion
 source_val_ensemble_acc_avg checkpoint selection
 selection tie-break: >= 选择更新 round
-prototype ensemble = 0.5 cls + 0.5 proto
+prototype ensemble = `cls_ensemble_weight` * cls + `proto_ensemble_weight` * proto (default: 0.5 / 0.5)
 train-time full forward source style statistics
 random training augmentation 保留
 ```
@@ -209,7 +209,6 @@ temperature =
     * 0.5 * (1 + cos(pi * router_progress))
 ```
 
-???? `--router_anneal_rounds`???????? `--comm`?
 
 ### Style 分组
 
@@ -323,6 +322,8 @@ prototype 聚合使用 class counts。若某个类别在所有 source client 中
 ## Checkpoint Selection
 
 checkpoint selection 只依赖 source validation ensemble accuracy：
+
+`ensemble accuracy` 使用当前 `--cls_ensemble_weight` 与 `--proto_ensemble_weight` 的融合概率。因此每个权重组均按自身的 source-validation ensemble accuracy 选择 checkpoint；权重也会写入 checkpoint 的 `best_val_acc_criterion` 和文件名。
 
 ```python
 selection_score = float(source_val_ensemble_acc_avg)
@@ -471,6 +472,17 @@ pip install -r requirements.txt
 
 ## 命令示例
 
+进入ssh工具后先运行
+```bash
+tmux attach -t fedmoe
+```
+进入会话，粘贴命令回车运行后，按` Ctrl+B `退出会话而不结束训练
+
+训练日志保存在：`/home/cvteam/zczmoe/FedDG_MoE_Extended/training_logs`
+
+
+### 以下为主实验参数
+
 PACS
 
 ```bash
@@ -482,9 +494,11 @@ python main_feddg_moe.py \
   --batch_size 64 \
   --test_batch_size 128 \
   --lr 1e-3 \
+  --weight_decay 1e-3 \
   --lambda_proto 0.8 \
   --proto_tau 0.1 \
   --proto_warmup_rounds 2 \
+  --router_anneal_rounds 20 \
   --content_rank 16 \
   --style_rank 4
 ```
@@ -501,16 +515,19 @@ python main_feddg_moe.py \
   --batch_size 64 \
   --test_batch_size 128 \
   --lr 1e-3 \
-  --lambda_proto 0.8 \
+  --weight_decay 1e-3 \
+  --lambda_proto 0.5 \
   --proto_tau 0.1 \
   --proto_warmup_rounds 2 \
-  --content_rank 16 \
+  --router_anneal_rounds 20 \
+  --content_rank 32 \
   --style_rank 4
 ```
 
 VLCS
 
 ```bash
+
 python main_feddg_moe.py \
   --dataset vlcs \
   --test_domain all \
@@ -519,25 +536,842 @@ python main_feddg_moe.py \
   --batch_size 64 \
   --test_batch_size 128 \
   --lr 1e-3 \
-  --lambda_proto 0.8 \
-  --proto_tau 0.1 \
+  --weight_decay 0.008 \
+  --lambda_proto 0.1 \
+  --proto_tau 0.5 \
   --proto_warmup_rounds 2 \
+  --router_anneal_rounds 20 \
   --content_rank 16 \
   --style_rank 4
 ```
+## 消融实验
 
 
-自动选择 dataloader worker 数：
+### 全局融合风格参数参与 FedAvg，自动不使用 TTA```--style_param_mode aggregate```
 
 ```bash
+(
 python main_feddg_moe.py \
   --dataset pacs \
-  --data_root ../datasets/PACS \
-  --test_domain photo \
-  --num_workers -1
+  --test_domain all \
+  --local_epochs 4 \
+  --comm 20 \
+  --batch_size 64 \
+  --test_batch_size 128 \
+  --lr 1e-3 \
+  --weight_decay 1e-3 \
+  --lambda_proto 0.8 \
+  --proto_tau 0.1 \
+  --proto_warmup_rounds 2 \
+  --router_anneal_rounds 20 \
+  --content_rank 16 \
+  --style_rank 4 \
+  --style_param_mode aggregate
+)&&(
+python main_feddg_moe.py \
+  --dataset officehome \
+  --test_domain all \
+  --local_epochs 4 \
+  --comm 20 \
+  --batch_size 64 \
+  --test_batch_size 128 \
+  --lr 1e-3 \
+  --weight_decay 1e-3 \
+  --lambda_proto 0.5 \
+  --proto_tau 0.1 \
+  --proto_warmup_rounds 2 \
+  --router_anneal_rounds 20 \
+  --content_rank 32 \
+  --style_rank 4 \
+  --style_param_mode aggregate
+)&&(
+python main_feddg_moe.py \
+  --dataset vlcs \
+  --test_domain all \
+  --local_epochs 4 \
+  --comm 20 \
+  --batch_size 64 \
+  --test_batch_size 128 \
+  --lr 1e-3 \
+  --weight_decay 0.008 \
+  --lambda_proto 0.1 \
+  --proto_tau 0.5 \
+  --proto_warmup_rounds 2 \
+  --router_anneal_rounds 20 \
+  --content_rank 16 \
+  --style_rank 4 \
+  --style_param_mode aggregate
+)
 ```
 
+### 去除训练原型损失```--lambda_proto 0```
 
+```bash
+(
+python main_feddg_moe.py \
+  --dataset pacs \
+  --test_domain all \
+  --local_epochs 4 \
+  --comm 20 \
+  --batch_size 64 \
+  --test_batch_size 128 \
+  --lr 1e-3 \
+  --weight_decay 1e-3 \
+  --lambda_proto 0 \
+  --proto_tau 0.1 \
+  --proto_warmup_rounds 2 \
+  --router_anneal_rounds 20 \
+  --content_rank 16 \
+  --style_rank 4
+)&&(
+python main_feddg_moe.py \
+  --dataset officehome \
+  --test_domain all \
+  --local_epochs 4 \
+  --comm 20 \
+  --batch_size 64 \
+  --test_batch_size 128 \
+  --lr 1e-3 \
+  --weight_decay 1e-3 \
+  --lambda_proto 0 \
+  --proto_tau 0.1 \
+  --proto_warmup_rounds 2 \
+  --router_anneal_rounds 20 \
+  --content_rank 32 \
+  --style_rank 4
+)&&(
+python main_feddg_moe.py \
+  --dataset vlcs \
+  --test_domain all \
+  --local_epochs 4 \
+  --comm 20 \
+  --batch_size 64 \
+  --test_batch_size 128 \
+  --lr 1e-3 \
+  --weight_decay 0.008 \
+  --lambda_proto 0 \
+  --proto_tau 0.5 \
+  --proto_warmup_rounds 2 \
+  --router_anneal_rounds 20 \
+  --content_rank 16 \
+  --style_rank 4
+)
+```
+
+## 双头权重敏感性实验
+
+### cls 0 proto 1
+
+```bash
+(
+python main_feddg_moe.py \
+  --dataset pacs \
+  --test_domain all \
+  --local_epochs 4 \
+  --comm 20 \
+  --batch_size 64 \
+  --test_batch_size 128 \
+  --lr 1e-3 \
+  --weight_decay 1e-3 \
+  --lambda_proto 0.8 \
+  --proto_tau 0.1 \
+  --proto_warmup_rounds 2 \
+  --router_anneal_rounds 20 \
+  --content_rank 16 \
+  --style_rank 4 \
+  --cls_ensemble_weight 0 \
+  --proto_ensemble_weight 1
+)&&(
+python main_feddg_moe.py \
+  --dataset officehome \
+  --test_domain all \
+  --local_epochs 4 \
+  --comm 20 \
+  --batch_size 64 \
+  --test_batch_size 128 \
+  --lr 1e-3 \
+  --weight_decay 1e-3 \
+  --lambda_proto 0.5 \
+  --proto_tau 0.1 \
+  --proto_warmup_rounds 2 \
+  --router_anneal_rounds 20 \
+  --content_rank 32 \
+  --style_rank 4 \
+  --cls_ensemble_weight 0 \
+  --proto_ensemble_weight 1
+)&&(
+python main_feddg_moe.py \
+  --dataset vlcs \
+  --test_domain all \
+  --local_epochs 4 \
+  --comm 20 \
+  --batch_size 64 \
+  --test_batch_size 128 \
+  --lr 1e-3 \
+  --weight_decay 0.008 \
+  --lambda_proto 0.1 \
+  --proto_tau 0.5 \
+  --proto_warmup_rounds 2 \
+  --router_anneal_rounds 20 \
+  --content_rank 16 \
+  --style_rank 4 \
+  --cls_ensemble_weight 0 \
+  --proto_ensemble_weight 1
+)
+```
+
+### cls 0.25 proto 0.75
+
+```bash
+(
+python main_feddg_moe.py \
+  --dataset pacs \
+  --test_domain all \
+  --local_epochs 4 \
+  --comm 20 \
+  --batch_size 64 \
+  --test_batch_size 128 \
+  --lr 1e-3 \
+  --weight_decay 1e-3 \
+  --lambda_proto 0.8 \
+  --proto_tau 0.1 \
+  --proto_warmup_rounds 2 \
+  --router_anneal_rounds 20 \
+  --content_rank 16 \
+  --style_rank 4 \
+  --cls_ensemble_weight 0.25 \
+  --proto_ensemble_weight 0.75
+)&&(
+python main_feddg_moe.py \
+  --dataset officehome \
+  --test_domain all \
+  --local_epochs 4 \
+  --comm 20 \
+  --batch_size 64 \
+  --test_batch_size 128 \
+  --lr 1e-3 \
+  --weight_decay 1e-3 \
+  --lambda_proto 0.5 \
+  --proto_tau 0.1 \
+  --proto_warmup_rounds 2 \
+  --router_anneal_rounds 20 \
+  --content_rank 32 \
+  --style_rank 4 \
+  --cls_ensemble_weight 0.25 \
+  --proto_ensemble_weight 0.75
+)&&(
+python main_feddg_moe.py \
+  --dataset vlcs \
+  --test_domain all \
+  --local_epochs 4 \
+  --comm 20 \
+  --batch_size 64 \
+  --test_batch_size 128 \
+  --lr 1e-3 \
+  --weight_decay 0.008 \
+  --lambda_proto 0.1 \
+  --proto_tau 0.5 \
+  --proto_warmup_rounds 2 \
+  --router_anneal_rounds 20 \
+  --content_rank 16 \
+  --style_rank 4 \
+  --cls_ensemble_weight 0.25 \
+  --proto_ensemble_weight 0.75
+)
+```
+
+### cls 0.75 proto 0.25
+
+```bash
+(
+python main_feddg_moe.py \
+  --dataset pacs \
+  --test_domain all \
+  --local_epochs 4 \
+  --comm 20 \
+  --batch_size 64 \
+  --test_batch_size 128 \
+  --lr 1e-3 \
+  --weight_decay 1e-3 \
+  --lambda_proto 0.8 \
+  --proto_tau 0.1 \
+  --proto_warmup_rounds 2 \
+  --router_anneal_rounds 20 \
+  --content_rank 16 \
+  --style_rank 4 \
+  --cls_ensemble_weight 0.75 \
+  --proto_ensemble_weight 0.25
+)&&(
+python main_feddg_moe.py \
+  --dataset officehome \
+  --test_domain all \
+  --local_epochs 4 \
+  --comm 20 \
+  --batch_size 64 \
+  --test_batch_size 128 \
+  --lr 1e-3 \
+  --weight_decay 1e-3 \
+  --lambda_proto 0.5 \
+  --proto_tau 0.1 \
+  --proto_warmup_rounds 2 \
+  --router_anneal_rounds 20 \
+  --content_rank 32 \
+  --style_rank 4 \
+  --cls_ensemble_weight 0.75 \
+  --proto_ensemble_weight 0.25
+)&&(
+python main_feddg_moe.py \
+  --dataset vlcs \
+  --test_domain all \
+  --local_epochs 4 \
+  --comm 20 \
+  --batch_size 64 \
+  --test_batch_size 128 \
+  --lr 1e-3 \
+  --weight_decay 0.008 \
+  --lambda_proto 0.1 \
+  --proto_tau 0.5 \
+  --proto_warmup_rounds 2 \
+  --router_anneal_rounds 20 \
+  --content_rank 16 \
+  --style_rank 4 \
+  --cls_ensemble_weight 0.75 \
+  --proto_ensemble_weight 0.25
+)
+```
+
+### cls 1 proto 0
+
+```bash
+(
+python main_feddg_moe.py \
+  --dataset pacs \
+  --test_domain all \
+  --local_epochs 4 \
+  --comm 20 \
+  --batch_size 64 \
+  --test_batch_size 128 \
+  --lr 1e-3 \
+  --weight_decay 1e-3 \
+  --lambda_proto 0.8 \
+  --proto_tau 0.1 \
+  --proto_warmup_rounds 2 \
+  --router_anneal_rounds 20 \
+  --content_rank 16 \
+  --style_rank 4 \
+  --cls_ensemble_weight 1 \
+  --proto_ensemble_weight 0
+)&&(
+python main_feddg_moe.py \
+  --dataset officehome \
+  --test_domain all \
+  --local_epochs 4 \
+  --comm 20 \
+  --batch_size 64 \
+  --test_batch_size 128 \
+  --lr 1e-3 \
+  --weight_decay 1e-3 \
+  --lambda_proto 0.5 \
+  --proto_tau 0.1 \
+  --proto_warmup_rounds 2 \
+  --router_anneal_rounds 20 \
+  --content_rank 32 \
+  --style_rank 4 \
+  --cls_ensemble_weight 1 \
+  --proto_ensemble_weight 0
+)&&(
+python main_feddg_moe.py \
+  --dataset vlcs \
+  --test_domain all \
+  --local_epochs 4 \
+  --comm 20 \
+  --batch_size 64 \
+  --test_batch_size 128 \
+  --lr 1e-3 \
+  --weight_decay 0.008 \
+  --lambda_proto 0.1 \
+  --proto_tau 0.5 \
+  --proto_warmup_rounds 2 \
+  --router_anneal_rounds 20 \
+  --content_rank 16 \
+  --style_rank 4 \
+  --cls_ensemble_weight 1 \
+  --proto_ensemble_weight 0
+)
+```
+
+## 内容适配器秩 超参数敏感性实验
+
+### PACS 4 8 32
+
+```bash
+(
+python main_feddg_moe.py \
+  --dataset pacs \
+  --test_domain all \
+  --local_epochs 4 \
+  --comm 20 \
+  --batch_size 64 \
+  --test_batch_size 128 \
+  --lr 1e-3 \
+  --weight_decay 1e-3 \
+  --lambda_proto 0.8 \
+  --proto_tau 0.1 \
+  --proto_warmup_rounds 2 \
+  --router_anneal_rounds 20 \
+  --content_rank 4 \
+  --style_rank 4
+)&&(
+python main_feddg_moe.py \
+  --dataset pacs \
+  --test_domain all \
+  --local_epochs 4 \
+  --comm 20 \
+  --batch_size 64 \
+  --test_batch_size 128 \
+  --lr 1e-3 \
+  --weight_decay 1e-3 \
+  --lambda_proto 0.8 \
+  --proto_tau 0.1 \
+  --proto_warmup_rounds 2 \
+  --router_anneal_rounds 20 \
+  --content_rank 8 \
+  --style_rank 4
+)&&(
+python main_feddg_moe.py \
+  --dataset pacs \
+  --test_domain all \
+  --local_epochs 4 \
+  --comm 20 \
+  --batch_size 64 \
+  --test_batch_size 128 \
+  --lr 1e-3 \
+  --weight_decay 1e-3 \
+  --lambda_proto 0.8 \
+  --proto_tau 0.1 \
+  --proto_warmup_rounds 2 \
+  --router_anneal_rounds 20 \
+  --content_rank 32 \
+  --style_rank 4
+)
+```
+
+### OfficeHome 4 8 16
+
+```bash
+(
+python main_feddg_moe.py \
+  --dataset officehome \
+  --test_domain all \
+  --local_epochs 4 \
+  --comm 20 \
+  --batch_size 64 \
+  --test_batch_size 128 \
+  --lr 1e-3 \
+  --weight_decay 1e-3 \
+  --lambda_proto 0.5 \
+  --proto_tau 0.1 \
+  --proto_warmup_rounds 2 \
+  --router_anneal_rounds 20 \
+  --content_rank 4 \
+  --style_rank 4
+)&&(
+python main_feddg_moe.py \
+  --dataset officehome \
+  --test_domain all \
+  --local_epochs 4 \
+  --comm 20 \
+  --batch_size 64 \
+  --test_batch_size 128 \
+  --lr 1e-3 \
+  --weight_decay 1e-3 \
+  --lambda_proto 0.5 \
+  --proto_tau 0.1 \
+  --proto_warmup_rounds 2 \
+  --router_anneal_rounds 20 \
+  --content_rank 8 \
+  --style_rank 4
+)&&(
+python main_feddg_moe.py \
+  --dataset officehome \
+  --test_domain all \
+  --local_epochs 4 \
+  --comm 20 \
+  --batch_size 64 \
+  --test_batch_size 128 \
+  --lr 1e-3 \
+  --weight_decay 1e-3 \
+  --lambda_proto 0.5 \
+  --proto_tau 0.1 \
+  --proto_warmup_rounds 2 \
+  --router_anneal_rounds 20 \
+  --content_rank 16 \
+  --style_rank 4
+)
+```
+### VLCS 4 8 32
+```bash
+(
+python main_feddg_moe.py \
+  --dataset vlcs \
+  --test_domain all \
+  --local_epochs 4 \
+  --comm 20 \
+  --batch_size 64 \
+  --test_batch_size 128 \
+  --lr 1e-3 \
+  --weight_decay 0.008 \
+  --lambda_proto 0.1 \
+  --proto_tau 0.5 \
+  --proto_warmup_rounds 2 \
+  --router_anneal_rounds 20 \
+  --content_rank 4 \
+  --style_rank 4
+)&&(
+python main_feddg_moe.py \
+  --dataset vlcs \
+  --test_domain all \
+  --local_epochs 4 \
+  --comm 20 \
+  --batch_size 64 \
+  --test_batch_size 128 \
+  --lr 1e-3 \
+  --weight_decay 0.008 \
+  --lambda_proto 0.1 \
+  --proto_tau 0.5 \
+  --proto_warmup_rounds 2 \
+  --router_anneal_rounds 20 \
+  --content_rank 8 \
+  --style_rank 4
+)&&(
+python main_feddg_moe.py \
+  --dataset vlcs \
+  --test_domain all \
+  --local_epochs 4 \
+  --comm 20 \
+  --batch_size 64 \
+  --test_batch_size 128 \
+  --lr 1e-3 \
+  --weight_decay 0.008 \
+  --lambda_proto 0.1 \
+  --proto_tau 0.5 \
+  --proto_warmup_rounds 2 \
+  --router_anneal_rounds 20 \
+  --content_rank 32 \
+  --style_rank 4
+)
+```
+
+## 统计响应适配器秩 超参数敏感性实验（固定内容16）
+
+### PACS  8  16 32
+
+```bash
+(
+python main_feddg_moe.py \
+  --dataset pacs \
+  --test_domain all \
+  --local_epochs 4 \
+  --comm 20 \
+  --batch_size 64 \
+  --test_batch_size 128 \
+  --lr 1e-3 \
+  --weight_decay 1e-3 \
+  --lambda_proto 0.8 \
+  --proto_tau 0.1 \
+  --proto_warmup_rounds 2 \
+  --router_anneal_rounds 20 \
+  --content_rank 16 \
+  --style_rank 8
+)&&(
+python main_feddg_moe.py \
+  --dataset pacs \
+  --test_domain all \
+  --local_epochs 4 \
+  --comm 20 \
+  --batch_size 64 \
+  --test_batch_size 128 \
+  --lr 1e-3 \
+  --weight_decay 1e-3 \
+  --lambda_proto 0.8 \
+  --proto_tau 0.1 \
+  --proto_warmup_rounds 2 \
+  --router_anneal_rounds 20 \
+  --content_rank 16 \
+  --style_rank 16
+)&&(
+python main_feddg_moe.py \
+  --dataset pacs \
+  --test_domain all \
+  --local_epochs 4 \
+  --comm 20 \
+  --batch_size 64 \
+  --test_batch_size 128 \
+  --lr 1e-3 \
+  --weight_decay 1e-3 \
+  --lambda_proto 0.8 \
+  --proto_tau 0.1 \
+  --proto_warmup_rounds 2 \
+  --router_anneal_rounds 20 \
+  --content_rank 16 \
+  --style_rank 32
+)
+```
+
+### OfficeHome  8 16 32
+
+```bash
+(
+python main_feddg_moe.py \
+  --dataset officehome \
+  --test_domain all \
+  --local_epochs 4 \
+  --comm 20 \
+  --batch_size 64 \
+  --test_batch_size 128 \
+  --lr 1e-3 \
+  --weight_decay 1e-3 \
+  --lambda_proto 0.5 \
+  --proto_tau 0.1 \
+  --proto_warmup_rounds 2 \
+  --router_anneal_rounds 20 \
+  --content_rank 16 \
+  --style_rank 8
+)&&(
+python main_feddg_moe.py \
+  --dataset officehome \
+  --test_domain all \
+  --local_epochs 4 \
+  --comm 20 \
+  --batch_size 64 \
+  --test_batch_size 128 \
+  --lr 1e-3 \
+  --weight_decay 1e-3 \
+  --lambda_proto 0.5 \
+  --proto_tau 0.1 \
+  --proto_warmup_rounds 2 \
+  --router_anneal_rounds 20 \
+  --content_rank 16 \
+  --style_rank 16
+)&&(
+python main_feddg_moe.py \
+  --dataset officehome \
+  --test_domain all \
+  --local_epochs 4 \
+  --comm 20 \
+  --batch_size 64 \
+  --test_batch_size 128 \
+  --lr 1e-3 \
+  --weight_decay 1e-3 \
+  --lambda_proto 0.5 \
+  --proto_tau 0.1 \
+  --proto_warmup_rounds 2 \
+  --router_anneal_rounds 20 \
+  --content_rank 16 \
+  --style_rank 32
+)
+```
+### VLCS  8 16 32
+```bash
+(
+python main_feddg_moe.py \
+  --dataset vlcs \
+  --test_domain all \
+  --local_epochs 4 \
+  --comm 20 \
+  --batch_size 64 \
+  --test_batch_size 128 \
+  --lr 1e-3 \
+  --weight_decay 0.008 \
+  --lambda_proto 0.1 \
+  --proto_tau 0.5 \
+  --proto_warmup_rounds 2 \
+  --router_anneal_rounds 20 \
+  --content_rank 16 \
+  --style_rank 8
+)&&(
+python main_feddg_moe.py \
+  --dataset vlcs \
+  --test_domain all \
+  --local_epochs 4 \
+  --comm 20 \
+  --batch_size 64 \
+  --test_batch_size 128 \
+  --lr 1e-3 \
+  --weight_decay 0.008 \
+  --lambda_proto 0.1 \
+  --proto_tau 0.5 \
+  --proto_warmup_rounds 2 \
+  --router_anneal_rounds 20 \
+  --content_rank 16 \
+  --style_rank 16
+)&&(
+python main_feddg_moe.py \
+  --dataset vlcs \
+  --test_domain all \
+  --local_epochs 4 \
+  --comm 20 \
+  --batch_size 64 \
+  --test_batch_size 128 \
+  --lr 1e-3 \
+  --weight_decay 0.008 \
+  --lambda_proto 0.1 \
+  --proto_tau 0.5 \
+  --proto_warmup_rounds 2 \
+  --router_anneal_rounds 20 \
+  --content_rank 16 \
+  --style_rank 32
+)
+```
+
+### 最后的总命令，用```&&```把所有命令连起来
+```bash
+(
+python main_feddg_moe.py \
+  --dataset pacs \
+  --test_domain all \
+  --local_epochs 4 \
+  --comm 20 \
+  --batch_size 64 \
+  --test_batch_size 128 \
+  --lr 1e-3 \
+  --weight_decay 1e-3 \
+  --lambda_proto 0.8 \
+  --proto_tau 0.1 \
+  --proto_warmup_rounds 2 \
+  --router_anneal_rounds 20 \
+  --content_rank 16 \
+  --style_rank 8
+)&&(
+python main_feddg_moe.py \
+  --dataset pacs \
+  --test_domain all \
+  --local_epochs 4 \
+  --comm 20 \
+  --batch_size 64 \
+  --test_batch_size 128 \
+  --lr 1e-3 \
+  --weight_decay 1e-3 \
+  --lambda_proto 0.8 \
+  --proto_tau 0.1 \
+  --proto_warmup_rounds 2 \
+  --router_anneal_rounds 20 \
+  --content_rank 16 \
+  --style_rank 16
+)&&(
+python main_feddg_moe.py \
+  --dataset pacs \
+  --test_domain all \
+  --local_epochs 4 \
+  --comm 20 \
+  --batch_size 64 \
+  --test_batch_size 128 \
+  --lr 1e-3 \
+  --weight_decay 1e-3 \
+  --lambda_proto 0.8 \
+  --proto_tau 0.1 \
+  --proto_warmup_rounds 2 \
+  --router_anneal_rounds 20 \
+  --content_rank 16 \
+  --style_rank 32
+)&&(
+python main_feddg_moe.py \
+  --dataset officehome \
+  --test_domain all \
+  --local_epochs 4 \
+  --comm 20 \
+  --batch_size 64 \
+  --test_batch_size 128 \
+  --lr 1e-3 \
+  --weight_decay 1e-3 \
+  --lambda_proto 0.5 \
+  --proto_tau 0.1 \
+  --proto_warmup_rounds 2 \
+  --router_anneal_rounds 20 \
+  --content_rank 16 \
+  --style_rank 8
+)&&(
+python main_feddg_moe.py \
+  --dataset officehome \
+  --test_domain all \
+  --local_epochs 4 \
+  --comm 20 \
+  --batch_size 64 \
+  --test_batch_size 128 \
+  --lr 1e-3 \
+  --weight_decay 1e-3 \
+  --lambda_proto 0.5 \
+  --proto_tau 0.1 \
+  --proto_warmup_rounds 2 \
+  --router_anneal_rounds 20 \
+  --content_rank 16 \
+  --style_rank 16
+)&&(
+python main_feddg_moe.py \
+  --dataset officehome \
+  --test_domain all \
+  --local_epochs 4 \
+  --comm 20 \
+  --batch_size 64 \
+  --test_batch_size 128 \
+  --lr 1e-3 \
+  --weight_decay 1e-3 \
+  --lambda_proto 0.5 \
+  --proto_tau 0.1 \
+  --proto_warmup_rounds 2 \
+  --router_anneal_rounds 20 \
+  --content_rank 16 \
+  --style_rank 32
+)&&(
+python main_feddg_moe.py \
+  --dataset vlcs \
+  --test_domain all \
+  --local_epochs 4 \
+  --comm 20 \
+  --batch_size 64 \
+  --test_batch_size 128 \
+  --lr 1e-3 \
+  --weight_decay 0.008 \
+  --lambda_proto 0.1 \
+  --proto_tau 0.5 \
+  --proto_warmup_rounds 2 \
+  --router_anneal_rounds 20 \
+  --content_rank 16 \
+  --style_rank 8
+)&&(
+python main_feddg_moe.py \
+  --dataset vlcs \
+  --test_domain all \
+  --local_epochs 4 \
+  --comm 20 \
+  --batch_size 64 \
+  --test_batch_size 128 \
+  --lr 1e-3 \
+  --weight_decay 0.008 \
+  --lambda_proto 0.1 \
+  --proto_tau 0.5 \
+  --proto_warmup_rounds 2 \
+  --router_anneal_rounds 20 \
+  --content_rank 16 \
+  --style_rank 16
+)&&(
+python main_feddg_moe.py \
+  --dataset vlcs \
+  --test_domain all \
+  --local_epochs 4 \
+  --comm 20 \
+  --batch_size 64 \
+  --test_batch_size 128 \
+  --lr 1e-3 \
+  --weight_decay 0.008 \
+  --lambda_proto 0.1 \
+  --proto_tau 0.5 \
+  --proto_warmup_rounds 2 \
+  --router_anneal_rounds 20 \
+  --content_rank 16 \
+  --style_rank 32
+)
+```
 
 ## CLI 参数
 
@@ -576,6 +1410,8 @@ Optimization / model 参数：
 | `--router_anneal_rounds` | same as `--comm` | router annealing rounds |
 | `--content_rank` | `32` | content adapter bottleneck rank |
 | `--style_rank` | `4` | style adapter bottleneck rank |
+| `--cls_ensemble_weight` | `0.5` | classifier-head fusion weight |
+| `--proto_ensemble_weight` | `0.5` | prototype-head fusion weight; the two weights must be non-negative and sum to `1` |
 
 Runtime / logging 参数：
 
@@ -585,76 +1421,3 @@ Runtime / logging 参数：
 | `--device` | auto | 有 CUDA 时默认为 `cuda`，否则 `cpu` |
 | `--log_dir` | `training_logs` | 文本日志和 checkpoint 目录 |
 | `--tb_log_dir` | `tb_runs` | TensorBoard log 目录 |
-
-## 输出文件
-
-每个任务的文本日志：
-
-```text
-training_logs/train_<dataset>_<target>_<timestamp>.log
-```
-
-checkpoint：
-
-```text
-training_logs/checkpoints/best_model_<dataset>_<target>_<timestamp>.pth
-training_logs/checkpoints/best_model_<dataset>_<target>_<timestamp>_with_test.pth
-```
-
-TensorBoard：
-
-```text
-tb_runs/<dataset>_<target>_<timestamp>/
-```
-
-常用 TensorBoard scalars：
-
-```text
-Source_Val_Ensemble_Accuracy_Avg
-Source_Val_Cls_Accuracy_Avg
-Source_Val_Proto_Accuracy_Avg
-Target_Test_Ensemble_Accuracy
-Target_Test_Cls_Accuracy
-Target_Test_Proto_Accuracy
-Train_Loss
-Selection_Score
-```
-
-启动 TensorBoard：
-
-```bash
-tensorboard --logdir tb_runs
-```
-
-## 复现说明
-
-脚本会设置 Python、NumPy 和 PyTorch 随机种子。dataloader worker 使用确定性 worker seed，train/val/test dataloader generator 使用 split 和 domain 相关的确定性 offset。
-
-训练 augmentation 保持随机，但受 dataloader generator 与 worker seed 控制。
-
-## 静态检查
-
-编译核心文件：
-
-```bash
-python -m py_compile \
-  client_train.py \
-  feddg_eval.py \
-  feddg_utils.py \
-  main_feddg_moe.py \
-  network/adapters.py \
-  network/get_network.py \
-  data/feddg_loaders.py
-```
-
-如果需要检查旧实验分支词汇，请把待查 pattern 放在本地 shell 变量或临时脚本里，不要把这些词重新写回 README：
-
-```bash
-grep -R "$OLD_EXPERIMENT_KEYWORD_PATTERN" .
-```
-
-Windows PowerShell 没有 `grep` 时可用：
-
-```powershell
-rg $env:OLD_EXPERIMENT_KEYWORD_PATTERN .
-```

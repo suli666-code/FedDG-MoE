@@ -26,7 +26,7 @@ def aggregate_main_expert(
     client_sample_counts: List[float],
     client_prototype_counts: List[torch.Tensor],
 ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor], torch.Tensor]:
-    """FedAvg for adapter, classifier, and class prototypes."""
+    """FedAvg for supplied adapter state, classifier, and class prototypes."""
     if not client_adapter_states:
         raise ValueError("Cannot aggregate empty client states.")
     sample_count_tensor = torch.tensor(client_sample_counts, dtype=torch.float32)
@@ -121,11 +121,17 @@ def seed_everything(seed: int) -> None:
         torch.backends.cudnn.benchmark = False
 
 
-def extract_adapter_state_from_model(model: torch.nn.Module) -> Dict[str, torch.Tensor]:
+def extract_adapter_state_from_model(
+    model: torch.nn.Module,
+    *,
+    include_style_params: bool = False,
+) -> Dict[str, torch.Tensor]:
+    """Extract trainable adapter state, optionally including style branches for FedAvg."""
     adapter_state: Dict[str, torch.Tensor] = {}
     featurizer_state = model[0].state_dict()
     for key, value in featurizer_state.items():
-        if _is_adapter_param_name(key) and ("style_down" not in key) and ("style_up" not in key):
+        is_style_param = ("style_down" in key) or ("style_up" in key)
+        if _is_adapter_param_name(key) and (include_style_params or not is_style_param):
             adapter_state[key] = value.detach().cpu().to(torch.float32)
     if len(adapter_state) == 0:
         raise RuntimeError(

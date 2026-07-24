@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from typing import Any, Dict, List, Tuple, Union
 
 import torch
@@ -245,6 +246,42 @@ def _build_group_source_w2_geometry(
     return means, stds, reference_scale, source_temperature
 
 
+def _build_global_source_w2_geometry(
+    group_geometries: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]],
+    valid_sources: list[str],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build one source geometry over concatenated early/middle/late statistics."""
+    means = torch.cat([group_geometries[group_name][0] for group_name in STYLE_GROUP_NAMES], dim=1)
+    stds = torch.cat([group_geometries[group_name][1] for group_name in STYLE_GROUP_NAMES], dim=1)
+    center = means.mean(dim=0)
+    reference_scale = torch.sqrt(
+        stds.square().mean(dim=0)
+        + (means - center).square().mean(dim=0)
+        + 1e-6
+    )
+    if not bool(torch.isfinite(reference_scale).all().item()):
+        raise RuntimeError("Global reference_scale contains non-finite values.")
+    pairwise_distances = []
+    for i in range(len(valid_sources)):
+        for j in range(i + 1, len(valid_sources)):
+            pairwise_distances.append(
+                _source_whitened_diag_w2(
+                    means[i],
+                    stds[i],
+                    means[j],
+                    stds[j],
+                    reference_scale,
+                )
+            )
+    if pairwise_distances:
+        source_temperature = torch.stack(pairwise_distances, dim=0).mean().clamp_min(1e-6)
+    else:
+        source_temperature = torch.tensor(1.0, dtype=torch.float32)
+    if not bool(torch.isfinite(source_temperature).all().item()) or float(source_temperature.item()) <= 0.0:
+        raise RuntimeError(f"Global source_temperature is invalid: {source_temperature}.")
+    return means, stds, reference_scale, source_temperature
+
+
 def _source_geometry_softmax_weights(
     distances: torch.Tensor,
     source_temperature: torch.Tensor,
@@ -313,14 +350,28 @@ def _ensemble_preds(
     proto_logits: torch.Tensor | None,
     *,
     prototype_temperature: float,
+    cls_ensemble_weight: float = 0.5,
+    proto_ensemble_weight: float = 0.5,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    cls_ensemble_weight = float(cls_ensemble_weight)
+    proto_ensemble_weight = float(proto_ensemble_weight)
+    if not math.isfinite(cls_ensemble_weight) or not math.isfinite(proto_ensemble_weight):
+        raise ValueError("Dual-head ensemble weights must be finite.")
+    if cls_ensemble_weight < 0.0 or proto_ensemble_weight < 0.0:
+        raise ValueError("Dual-head ensemble weights must be non-negative.")
+    if not math.isclose(cls_ensemble_weight + proto_ensemble_weight, 1.0, abs_tol=1e-6):
+        raise ValueError(
+            "Dual-head ensemble weights must sum to 1, got "
+            f"cls={cls_ensemble_weight}, proto={proto_ensemble_weight}."
+        )
+
     cls_probs = torch.softmax(cls_logits.to(torch.float32), dim=1)
     preds_cls = cls_probs.argmax(dim=1)
     if proto_logits is None:
         return preds_cls, preds_cls, preds_cls
     tau = max(float(prototype_temperature), 1e-6)
     proto_probs = torch.softmax(proto_logits.to(torch.float32) / tau, dim=1)
-    ensemble_probs = 0.5 * cls_probs + 0.5 * proto_probs
+    ensemble_probs = cls_ensemble_weight * cls_probs + proto_ensemble_weight * proto_probs
     return ensemble_probs.argmax(dim=1), preds_cls, proto_probs.argmax(dim=1)
 
 
@@ -382,6 +433,14 @@ def evaluate_target_with_style_mode(
         group_name: _build_group_source_w2_geometry(client_style_stats, valid_sources, group_name)
         for group_name in STYLE_GROUP_NAMES
     }
+    tta_fusion = str(getattr(args, "tta_fusion", "global")).strip().lower()
+    if tta_fusion not in {"grouped", "global"}:
+        raise ValueError(f"Unsupported --tta_fusion mode: {tta_fusion}")
+    global_geometry = (
+        _build_global_source_w2_geometry(group_geometries, valid_sources)
+        if tta_fusion == "global"
+        else None
+    )
     use_amp = device.type == "cuda"
     uniform_weights = torch.full((len(valid_sources),), 1.0 / float(len(valid_sources)), dtype=torch.float32)
     uniform_group_weights = {group_name: uniform_weights for group_name in STYLE_GROUP_NAMES}
@@ -413,6 +472,8 @@ def evaluate_target_with_style_mode(
         group_name: torch.zeros(len(valid_sources), dtype=torch.float32)
         for group_name in STYLE_GROUP_NAMES
     }
+    global_distance_sum = torch.zeros(len(valid_sources), dtype=torch.float32)
+    global_weight_sum = torch.zeros(len(valid_sources), dtype=torch.float32)
     batch_count = 0
 
     try:
@@ -422,20 +483,34 @@ def evaluate_target_with_style_mode(
             with torch.amp.autocast("cuda", enabled=use_amp):
                 _ = featurizer(imgs)
             raw_feature_groups = collect_style_anchor_feature_groups(featurizer)
-            group_weights: dict[str, torch.Tensor] = {}
-            for group_name in STYLE_GROUP_NAMES:
-                source_means, source_stds, reference_scale, source_temperature = group_geometries[group_name]
-                distances = _raw_batch_distances(
-                    raw_feature_groups[group_name].detach(),
-                    source_means,
-                    source_stds,
-                    reference_scale,
+            if tta_fusion == "grouped":
+                group_weights: dict[str, torch.Tensor] = {}
+                for group_name in STYLE_GROUP_NAMES:
+                    source_means, source_stds, reference_scale, source_temperature = group_geometries[group_name]
+                    distances = _raw_batch_distances(
+                        raw_feature_groups[group_name].detach(),
+                        source_means,
+                        source_stds,
+                        reference_scale,
+                    )
+                    weights = _source_geometry_softmax_weights(distances, source_temperature)
+                    _validate_style_posterior(distances, weights, source_temperature)
+                    group_weights[group_name] = weights
+                    distance_sum[group_name] += distances.detach().cpu().to(torch.float32)
+                    weight_sum[group_name] += weights.detach().cpu().to(torch.float32)
+            else:
+                assert global_geometry is not None
+                source_means, source_stds, reference_scale, source_temperature = global_geometry
+                raw_features = torch.cat(
+                    [raw_feature_groups[group_name].detach() for group_name in STYLE_GROUP_NAMES],
+                    dim=1,
                 )
+                distances = _raw_batch_distances(raw_features, source_means, source_stds, reference_scale)
                 weights = _source_geometry_softmax_weights(distances, source_temperature)
                 _validate_style_posterior(distances, weights, source_temperature)
-                group_weights[group_name] = weights
-                distance_sum[group_name] += distances.detach().cpu().to(torch.float32)
-                weight_sum[group_name] += weights.detach().cpu().to(torch.float32)
+                group_weights = {group_name: weights for group_name in STYLE_GROUP_NAMES}
+                global_distance_sum += distances.detach().cpu().to(torch.float32)
+                global_weight_sum += weights.detach().cpu().to(torch.float32)
 
             load_adapter_state_to_model(
                 model,
@@ -455,6 +530,8 @@ def evaluate_target_with_style_mode(
                 logits,
                 proto_logits,
                 prototype_temperature=args.prototype_temperature,
+                cls_ensemble_weight=args.cls_ensemble_weight,
+                proto_ensemble_weight=args.proto_ensemble_weight,
             )
             labels = batch[1].to(device, non_blocking=True)
             correct_ensemble += (preds_ensemble == labels).sum().item()
@@ -479,26 +556,45 @@ def evaluate_target_with_style_mode(
             "adapter_names": list(group_adapter_names["late"]),
         },
     }
-    groups_report: Dict[str, Dict[str, Any]] = {}
-    for group_name in STYLE_GROUP_NAMES:
-        _source_means, _source_stds, reference_scale, source_temperature = group_geometries[group_name]
-        groups_report[group_name] = {
-            "distances": _tensor_report(valid_sources, distance_sum[group_name] / denom_batches),
-            "weights": _tensor_report(valid_sources, weight_sum[group_name] / denom_batches),
-            "source_temperature": float(source_temperature.detach().cpu().item()),
-            "reference_scale_mean": float(reference_scale.detach().cpu().mean().item()),
-            "reference_scale_min": float(reference_scale.detach().cpu().min().item()),
-            "reference_scale_max": float(reference_scale.detach().cpu().max().item()),
+    if tta_fusion == "grouped":
+        groups_report: Dict[str, Dict[str, Any]] = {}
+        for group_name in STYLE_GROUP_NAMES:
+            _source_means, _source_stds, reference_scale, source_temperature = group_geometries[group_name]
+            groups_report[group_name] = {
+                "distances": _tensor_report(valid_sources, distance_sum[group_name] / denom_batches),
+                "weights": _tensor_report(valid_sources, weight_sum[group_name] / denom_batches),
+                "source_temperature": float(source_temperature.detach().cpu().item()),
+                "reference_scale_mean": float(reference_scale.detach().cpu().mean().item()),
+                "reference_scale_min": float(reference_scale.detach().cpu().min().item()),
+                "reference_scale_max": float(reference_scale.detach().cpu().max().item()),
+            }
+        report = {
+            "mode": "raw_batch_grouped",
+            "metric": "grouped_source_whitened_diag_w2",
+            "group_definition": group_definition,
+            "groups": groups_report,
+            "batch_count": int(batch_count),
+            "stabilization": "none",
         }
-    report = {
-        "mode": "raw_batch_grouped",
-        "metric": "grouped_source_whitened_diag_w2",
-        "group_definition": group_definition,
-        "groups": groups_report,
-        "batch_count": int(batch_count),
-        "stabilization": "none",
-    }
-    logger.info("[Test-Time Style] mode=raw_batch_grouped metric=grouped_source_whitened_diag_w2 report=%s", report)
+    else:
+        assert global_geometry is not None
+        _source_means, _source_stds, reference_scale, source_temperature = global_geometry
+        report = {
+            "mode": "raw_batch_global",
+            "metric": "global_source_whitened_diag_w2",
+            "group_definition": group_definition,
+            "global": {
+                "distances": _tensor_report(valid_sources, global_distance_sum / denom_batches),
+                "weights": _tensor_report(valid_sources, global_weight_sum / denom_batches),
+                "source_temperature": float(source_temperature.detach().cpu().item()),
+                "reference_scale_mean": float(reference_scale.detach().cpu().mean().item()),
+                "reference_scale_min": float(reference_scale.detach().cpu().min().item()),
+                "reference_scale_max": float(reference_scale.detach().cpu().max().item()),
+            },
+            "batch_count": int(batch_count),
+            "stabilization": "none",
+        }
+    logger.info("[Test-Time Style] mode=%s report=%s", report["mode"], report)
     denom = max(1, total)
     return correct_ensemble / denom, correct_cls / denom, correct_proto / denom, report
 
@@ -511,6 +607,8 @@ def evaluate_target(
     *,
     global_prototypes: torch.Tensor | None = None,
     prototype_temperature: float = 0.1,
+    cls_ensemble_weight: float = 0.5,
+    proto_ensemble_weight: float = 0.5,
 ) -> Tuple[float, float, float]:
     model.eval()
     device = torch.device(device)
@@ -539,6 +637,8 @@ def evaluate_target(
             logits,
             proto_scores,
             prototype_temperature=prototype_temperature,
+            cls_ensemble_weight=cls_ensemble_weight,
+            proto_ensemble_weight=proto_ensemble_weight,
         )
         correct_ensemble += (preds_ensemble == labels).sum().item()
         correct_cls += (preds_cls == labels).sum().item()
